@@ -521,7 +521,15 @@ class Linear(nn.Linear, LoraLayer):
         self.active_adapter = adapter_name
 
     def merge(self):
-        raise NotImplementedError(' need reimplementation!')
+        if self.active_adapter not in self.lora_A.keys():
+            return
+        if self.merged:
+            warnings.warn("Already merged. Nothing to do.")
+            return
+        if self.r_ab[self.active_adapter] > 0:
+            _prod_AB = torch.mm(self.lora_A[self.active_adapter].T, self.lora_B[self.active_adapter].T) + 1
+            self.weight.data = (self.weight.data) * _prod_AB.T
+            self.merged = True
 
     def unmerge(self):
         if self.active_adapter not in self.lora_A.keys():

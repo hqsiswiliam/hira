@@ -5,3 +5,6 @@
 /.idea
 /data_file/llm_adapt.zip
 /data_file/hira_datafile.zip
+/results_hira/
+/results_to_send_out/
+/results_peft_hira/
