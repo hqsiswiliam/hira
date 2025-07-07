@@ -173,7 +173,9 @@ if peft_type == 'hira':
 elif peft_type == 'peft_hira':
     init_a, init_b = args.init_ab.split(',')
     model, tokenizer, model_config = get_peft_hira_models(load_bit=args.load_bit,
-                                                     model_name=model_name, enable_checkpoint=args.enable_grad_ckpt,target_modules=args.target_modules,)
+                                                          r=args.r_ab,
+                                                     model_name=model_name, enable_checkpoint=args.enable_grad_ckpt,
+                                                          target_modules=args.target_modules,)
 elif peft_type == 'fft':
     model, tokenizer, model_config = get_fft_models(load_bit=args.load_bit,
                                                     model_name=model_name, enable_checkpoint=args.enable_grad_ckpt)
