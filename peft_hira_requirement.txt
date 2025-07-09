@@ -1,3 +1,13 @@
+# Tell pip to use the PyTorch CUDA 11.8 wheel index first
+--extra-index-url https://download.pytorch.org/whl/cu118
+
+# Now list the CUDA-enabled packages by name (optionally pin versions)
+torch==2.7.1+cu118
+torchvision==0.22.1+cu118
+torchaudio==2.7.1+cu118
+
+# Back to the default PyPI for everything else
+--index-url https://pypi.org/simple
 absl-py==2.1.0
 accelerate==1.8.1
 aiohttp==3.9.3
@@ -91,9 +101,6 @@ tensorboard==2.16.2
 tensorboard-data-server==0.7.2
 threadpoolctl==3.3.0
 tokenizers==0.21.2
-torch==2.7.1+cu118
-torchaudio==2.7.1+cu118
-torchvision==0.22.1+cu118
 tqdm==4.66.2
 transformers==4.53.1
 triton==3.3.1
