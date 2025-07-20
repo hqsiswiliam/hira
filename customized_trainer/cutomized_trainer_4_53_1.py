@@ -13,42 +13,53 @@
 # limitations under the License.
 
 import contextlib
+import glob
+import os
 from copy import deepcopy
+from functools import reduce
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
+import peft
+import safetensors
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel
 from torch.utils.data import Dataset
 
 from transformers.generation.configuration_utils import GenerationConfig
-from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled, deepspeed_init, deepspeed_load_checkpoint
 from transformers.integrations.fsdp import is_fsdp_managed_module
-from transformers.trainer import Trainer, _is_peft_model
-from transformers.utils import is_datasets_available, logging, find_labels, can_return_loss
+from transformers.trainer import Trainer, _is_peft_model, TRAINER_STATE_NAME
+from transformers.utils import is_datasets_available, logging, find_labels, can_return_loss, is_sagemaker_mp_enabled, \
+    ADAPTER_SAFE_WEIGHTS_NAME, ADAPTER_WEIGHTS_NAME, WEIGHTS_NAME, SAFE_WEIGHTS_NAME, is_peft_available, \
+    WEIGHTS_INDEX_NAME
 from transformers.utils.deprecation import deprecate_kwarg
 
-
+if is_sagemaker_mp_enabled():
+    import smdistributed.modelparallel.torch as smp
 if is_datasets_available():
     import datasets
 
-if TYPE_CHECKING:
-    from torch.utils.data import IterableDataset
+# if TYPE_CHECKING:
+from torch.utils.data import IterableDataset
 
-    from transformers.data.data_collator import DataCollator
-    from transformers.feature_extraction_utils import FeatureExtractionMixin
-    from transformers.image_processing_utils import BaseImageProcessor
-    from transformers.modeling_utils import PreTrainedModel
-    from transformers.processing_utils import ProcessorMixin
-    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-    from transformers.trainer_callback import TrainerCallback
-    from transformers.trainer_utils import EvalPrediction, PredictionOutput
-    from transformers.training_args import TrainingArguments
+from transformers.data.data_collator import DataCollator
+from transformers.feature_extraction_utils import FeatureExtractionMixin
+from transformers.image_processing_utils import BaseImageProcessor
+from transformers.modeling_utils import PreTrainedModel, load_sharded_checkpoint
+from transformers.processing_utils import ProcessorMixin
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from transformers.trainer_callback import TrainerCallback, TrainerState
+from transformers.trainer_utils import EvalPrediction, PredictionOutput
+from transformers.training_args import TrainingArguments
 
 
 logger = logging.get_logger(__name__)
 
+CUSTOM_PEFT_MODEL_NAMES = [
+    peft.PeftModel,
+]
 
 class Seq2SeqTrainer(Trainer):
     @deprecate_kwarg("tokenizer", new_name="processing_class", version="5.0.0", raise_if_both_names=True)
@@ -400,3 +411,104 @@ class Seq2SeqTrainer(Trainer):
         )
         padded_tensor[:, : tensor.shape[-1]] = tensor
         return padded_tensor
+
+    def _load_best_model(self, order=-1):
+        if self.state.best_model_checkpoint is None and self.args.resume_from_checkpoint is not None:
+            checkpoint_paths = glob.glob(f'{self.args.resume_from_checkpoint}/checkpoint-*')
+            checkpoint_paths.sort(key=lambda x: int(x.split('-')[-1]))
+            checkpoint_path = checkpoint_paths[order]
+            self.state = TrainerState.load_from_json(os.path.join(checkpoint_path, TRAINER_STATE_NAME))
+        logger.info(f"Loading best model from {self.state.best_model_checkpoint} (score: {self.state.best_metric}).")
+        print(f"Loading best model from {self.state.best_model_checkpoint} (score: {self.state.best_metric}).")
+        best_model_path = os.path.join(self.state.best_model_checkpoint, WEIGHTS_NAME)
+        best_safe_model_path = os.path.join(self.state.best_model_checkpoint, SAFE_WEIGHTS_NAME)
+        best_adapter_model_path = os.path.join(self.state.best_model_checkpoint, ADAPTER_WEIGHTS_NAME)
+        best_safe_adapter_model_path = os.path.join(self.state.best_model_checkpoint, ADAPTER_SAFE_WEIGHTS_NAME)
+
+        model = self.model_wrapped if is_sagemaker_mp_enabled() else self.model
+        if (
+                os.path.exists(best_model_path)
+                or os.path.exists(best_safe_model_path)
+                or os.path.exists(best_adapter_model_path)
+                or os.path.exists(best_safe_adapter_model_path)
+        ):
+            # if eval is called w/o train, handle model prep here
+            if self.is_deepspeed_enabled and self.deepspeed is None:
+                _, _ = deepspeed_init(self, num_training_steps=0, inference=True)
+            # when we do inference directly without init ds, we load normal ckpt the model first
+            if self.is_deepspeed_enabled and 'deepspeed.runtime.engine.DeepSpeedEngine' in str(
+                    self.model_wrapped.__class__):
+                deepspeed_load_checkpoint(self.model_wrapped, self.state.best_model_checkpoint,
+                                          load_module_strict=False)
+            else:
+                has_been_loaded = True
+                if is_sagemaker_mp_enabled():
+                    if os.path.isfile(os.path.join(self.state.best_model_checkpoint, "user_content.pt")):
+                        # If the 'user_content.pt' file exists, load with the new smp api.
+                        # Checkpoint must have been saved with the new smp api.
+                        smp.resume_from_checkpoint(
+                            path=self.state.best_model_checkpoint,
+                            tag=WEIGHTS_NAME,
+                            partial=False,
+                            load_optimizer=False,
+                        )
+                    else:
+                        # If the 'user_content.pt' file does NOT exist, load with the old smp api.
+                        # Checkpoint must have been saved with the old smp api.
+                        if self.args.save_safetensors and os.path.isfile(best_safe_model_path):
+                            state_dict = safetensors.torch.load_file(best_safe_model_path, device="cpu")
+                        else:
+                            state_dict = torch.load(best_model_path, map_location="cpu")
+
+                        state_dict["_smp_is_partial"] = False
+                        load_result = model.load_state_dict(state_dict, strict=True)
+                elif self.is_fsdp_enabled:
+                    self.accelerator.state.fsdp_plugin.load_model(
+                        self.accelerator, model, self.state.best_model_checkpoint
+                    )
+                else:
+                    check_is_custom_peft = [isinstance(model, _c) for _c in CUSTOM_PEFT_MODEL_NAMES]
+                    check_is_custom_peft = reduce(lambda x, y: x or y, check_is_custom_peft, False)
+                    if is_peft_available() and check_is_custom_peft:
+                        # If train a model using PEFT & LoRA, assume that adapter have been saved properly.
+                        if hasattr(model, "active_adapter") and hasattr(model, "load_adapter"):
+                            if os.path.exists(best_adapter_model_path) or os.path.exists(best_safe_adapter_model_path):
+                                model.load_adapter(self.state.best_model_checkpoint, model.active_adapter)
+                                # Load_adapter has no return value present, modify it when appropriate.
+                                from torch.nn.modules.module import _IncompatibleKeys
+
+                                load_result = _IncompatibleKeys([], [])
+                            else:
+                                logger.warning(
+                                    "The intermediate checkpoints of PEFT may not be saved correctly, "
+                                    f"using `TrainerCallback` to save {ADAPTER_WEIGHTS_NAME} in corresponding folders, "
+                                    "here are some examples https://github.com/huggingface/peft/issues/96"
+                                )
+                                has_been_loaded = False
+                        else:
+                            logger.warning("Could not load adapter model, make sure to have `peft>=0.3.0` installed")
+                            has_been_loaded = False
+                    else:
+                        # We load the model state dict on the CPU to avoid an OOM error.
+                        if self.args.save_safetensors and os.path.isfile(best_safe_model_path):
+                            state_dict = safetensors.torch.load_file(best_safe_model_path, device="cpu")
+                        else:
+                            state_dict = torch.load(best_model_path, map_location="cpu")
+
+                        # If the model is on the GPU, it still works!
+                        # workaround for FSDP bug https://github.com/pytorch/pytorch/issues/82963
+                        # which takes *args instead of **kwargs
+                        load_result = model.load_state_dict(state_dict, False)
+                if not is_sagemaker_mp_enabled() and has_been_loaded:
+                    self._issue_warnings_after_load(load_result)
+        elif os.path.exists(os.path.join(self.state.best_model_checkpoint, WEIGHTS_INDEX_NAME)):
+            load_result = load_sharded_checkpoint(
+                model, self.state.best_model_checkpoint, strict=is_sagemaker_mp_enabled()
+            )
+            if not is_sagemaker_mp_enabled():
+                self._issue_warnings_after_load(load_result)
+        else:
+            logger.warning(
+                f"Could not locate the best model at {best_model_path}, if you are running a distributed training "
+                "on multiple nodes, you should activate `--save_on_each_node`."
+            )
