@@ -1,5 +1,7 @@
+import ctypes
 import os
 import pickle
+import platform
 
 import numpy as np
 from dotenv import load_dotenv
@@ -19,6 +21,45 @@ from datetime import datetime
 import jsonlines
 import torch
 import transformers
+
+def ppc_hotfix():
+    # Only run on ppc64le
+    if platform.machine() != 'ppc64le':
+        return
+
+    # 1) Preload libstdc++
+    libstdcxx = os.path.join(os.environ.get("CONDA_PREFIX", ""), "lib", "libstdc++.so.6")
+    if os.path.exists(libstdcxx):
+        ctypes.CDLL(libstdcxx, mode=ctypes.RTLD_GLOBAL)
+
+    # 2) Preload Arrow C++ runtime
+    lib_dir = os.path.join(os.environ.get("CONDA_PREFIX", ""), "lib")
+    for fname in os.listdir(lib_dir):
+        if fname.startswith("libarrow.so."):
+            ctypes.CDLL(os.path.join(lib_dir, fname), mode=ctypes.RTLD_GLOBAL)
+            break
+
+    # 3) Preload Python helper
+    helper = os.path.join(
+        os.environ.get("CONDA_PREFIX", ""),
+        "lib/python{py_ver}/site-packages/pyarrow/libarrow_python.so".format(
+            py_ver="".join(map(str, platform.python_version_tuple()[:2]))
+        )
+    )
+    if os.path.exists(helper):
+        ctypes.CDLL(helper, mode=ctypes.RTLD_GLOBAL)
+ppc_hotfix()
+# ─────────────────────────────────────────────────────────────
+# Allow DeepSpeed’s DynamicLossScaler to be unpickled,
+# and disable weights_only so torch.load does a full load.
+torch.serialization.add_safe_globals([
+    "deepspeed.runtime.fp16.loss_scaler.DynamicLossScaler"
+])
+# If you trust the checkpoint and need optimizer/state loaded, set this False:
+torch.serialization._DEFAULT_WEIGHTS_ONLY = False
+# ─────────────────────────────────────────────────────────────
+
+
 from pytictoc import TicToc
 from models.get_models import print_trainable_parameters, get_tokenizer, get_prefix_tuning_models, get_hira_models, \
     get_fft_models, get_peft_hira_models
@@ -61,7 +102,7 @@ parser.add_argument('--load_order', type=int, default=-1)
 parser.add_argument('--init_ab', type=str, default='kaiming,zero')
 parser.add_argument('--train_ab', type=str, default='yy', help='y means yes, n means no')
 parser.add_argument('--seed', default=None, type=int)
-parser.add_argument('--do_sample', default='false', type=str)
+parser.add_argument('--do_sample', default='yes', type=str)
 parser.add_argument('--rand_R', action='store_true')
 parser.add_argument('--exp_name', default='', type=str)
 parser.add_argument('--decoding', type=str, default='default', choices=['default', 'greedy'])
@@ -321,6 +362,13 @@ else:
     train_tic = TicToc()
     train_tic.tic()
     trainer.train()
+    # ─────────────────────────────────────────────────────────────
+    # Clean up the NCCL process group to avoid “double free” errors
+    import torch.distributed as dist
+    if dist.is_initialized():
+        dist.destroy_process_group()
+    # ─────────────────────────────────────────────────────────────
+
     train_seconds = train_tic.tocvalue()
 
 kwgenargs = {}
@@ -432,6 +480,14 @@ else:
                                   pad_token_id=tokenizer.pad_token_id,
                                   do_sample=False, num_beams=4,
                                   length_penalty=0.9, no_repeat_ngram_size=4)
+
+# ─────────────────────────────────────────────────────────────
+# Clean up the NCCL process group to avoid “double free” errors
+import torch.distributed as dist
+if dist.is_initialized():
+    dist.destroy_process_group()
+# ─────────────────────────────────────────────────────────────
+
 if not isinstance(eval_result, dict):
     if args.ckpt is None:
         output_path = '{}/output.jsonl'.format(output_dir_by_time)
