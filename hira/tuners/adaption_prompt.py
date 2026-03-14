@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from peft.utils.config import PeftConfig, PeftType
+from peft.config import PeftConfig, PeftType
 from peft.utils.other import _freeze_adapter, _get_submodules
 
 
